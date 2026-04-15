@@ -3,11 +3,8 @@
 #include "esp_log.h"
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
-#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
 #include "driver/uart.h" 
 #include "nvs_flash.h"
 
@@ -21,11 +18,11 @@
 #define RADIO_MOSI  (10)
 
 #define UART_NUM         UART_NUM_1
-#define TXD_PIN          33  // Conectar al RX del sensor (GPIO 18)
-#define RXD_PIN          35  // Conectar al TX del sensor (GPIO 17)
+#define TXD_PIN          33  // Al RX del ESP32
+#define RXD_PIN          35  // Al TX del ESP32
 #define UART_BAUD_RATE   115200
 
-static const char *TAG = "HELTEC_MASTER";
+static const char *TAG = "HELTEC_UNIFICADO";
 
 uint8_t devEui[]  = {0x34, 0xCD, 0xB0, 0xFF, 0xFE, 0x3D, 0x82, 0x60};
 uint8_t joinEui[] = {0x34, 0xCD, 0xB0, 0xFF, 0xFE, 0x3D, 0x82, 0x60}; 
@@ -37,32 +34,6 @@ uint64_t arrayTo64(uint8_t* arr) {
     return value;
 }
 
-void sync_time_with_compiler() {
-    struct tm tm;
-    char month_str[4];
-    int day, year, hour, minute, second;
-    const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    sscanf(__DATE__, "%3s %d %d", month_str, &day, &year);
-    sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second);
-    tm.tm_year = year - 1900;
-    tm.tm_mon = (strstr(months, month_str) - months) / 3;
-    tm.tm_mday = day;
-    tm.tm_hour = hour;
-    tm.tm_min = minute;
-    tm.tm_sec = second;
-    tm.tm_isdst = -1;
-    struct timeval tv = { .tv_sec = mktime(&tm), .tv_usec = 0 };
-    settimeofday(&tv, NULL);
-}
-
-void get_timestamp(char *buf) {
-    time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    strftime(buf, 20, "%H:%M:%S", &timeinfo);
-}
-
 void init_uart(void) {
     uart_config_t uart_config = {
         .baud_rate = UART_BAUD_RATE,
@@ -72,15 +43,14 @@ void init_uart(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, 1024 * 2, 0, 0, NULL, 0));
+    // Buffer de 2048 para no perder nada durante el Join
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, 2048, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 }
 
 extern "C" void app_main(void) {
-    char t_buf[20];
     nvs_flash_init();
-    sync_time_with_compiler();
     init_uart();
 
     Esp32S3Hal hal(RADIO_SCK, RADIO_MISO, RADIO_MOSI);
@@ -91,16 +61,16 @@ extern "C" void app_main(void) {
     radio.setTCXO(1.8, 500); 
     vTaskDelay(pdMS_TO_TICKS(1000)); 
     radio.setDio2AsRfSwitch(true);    
-    radio.setOutputPower(14); 
+    radio.setOutputPower(14);
     radio.setRxBoostedGainMode(false); 
 
     LoRaWANNode node(&radio, &EU868);
     node.beginOTAA(arrayTo64(joinEui), arrayTo64(devEui), appKey, appKey);
     
+    // --- CONEXIÓN AUTOMÁTICA CON REINICIO (Tu lógica original) ---
     bool unido = false;
     while(!unido) {
-        get_timestamp(t_buf);
-        ESP_LOGI(TAG, "[%s] Intentando Join...", t_buf);
+        ESP_LOGI(TAG, "Intentando Join...");
         int16_t state = node.activateOTAA();
         if (state == RADIOLIB_LORAWAN_NEW_SESSION || state == RADIOLIB_ERR_NONE) {
             ESP_LOGI(TAG, "¡CONECTADO!");
@@ -112,26 +82,24 @@ extern "C" void app_main(void) {
         }
     }
 
-    TickType_t ultimo_envio = 0;
+    // --- MODO ESCUCHA PASIVA UART ---
+    uint8_t buffer[128];
     while (true) {
-        if ((xTaskGetTickCount() - ultimo_envio) >= pdMS_TO_TICKS(30000) || ultimo_envio == 0) {
-            ESP_LOGI(TAG, "Solicitando dato al sensor...");
-            const char* cmd = "G";
-            uart_write_bytes(UART_NUM, cmd, 1);
+        // Bajamos el timeout a 1 segundo para no quedarnos bloqueados eternamente
+        int rxBytes = uart_read_bytes(UART_NUM, buffer, sizeof(buffer)-1, pdMS_TO_TICKS(1000));
 
-            uint8_t buffer[128];
-            int rxBytes = uart_read_bytes(UART_NUM, buffer, sizeof(buffer)-1, pdMS_TO_TICKS(1500));
-
-            if (rxBytes > 0) {
-                buffer[rxBytes] = '\0';
-                get_timestamp(t_buf);
-                ESP_LOGI(TAG, "[%s] Enviando LoRa: %s", t_buf, (char*)buffer);
-                node.sendReceive(buffer, rxBytes);
-            } else {
-                ESP_LOGW(TAG, "Sin respuesta del sensor.");
+        if (rxBytes > 0) {
+            buffer[rxBytes] = '\0';
+            ESP_LOGW(TAG, "¡ALGO HA LLEGADO! (%d bytes): %s", rxBytes, (char*)buffer);
+            
+            // Solo intentamos enviar a LoRa si la trama empieza por 'P'
+            if (buffer[0] == 'P') {
+                int16_t tx_state = node.sendReceive(buffer, rxBytes);
+                if (tx_state == RADIOLIB_ERR_NONE) ESP_LOGI(TAG, "Uplink OK");
             }
-            ultimo_envio = xTaskGetTickCount();
+        } else {
+            // Esto saldrá cada segundo si el cable está "muerto"
+            ESP_LOGD(TAG, "Escuchando UART... (Silencio en el cable)");
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
