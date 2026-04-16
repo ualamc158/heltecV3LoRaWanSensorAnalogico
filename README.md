@@ -1,55 +1,53 @@
-# Nodo LoRaWAN Maestro (Heltec V3) - Transmisor de Presión
+# Heltec V3 LoRaWAN Bridge - Transmisor de Presión
 
-Este repositorio contiene la aplicación de un **Heltec WiFi LoRa 32 (V3)** que actúa como el **"Maestro"** en un sistema de monitorización de presión. Su función principal es coordinarse con un sensor esclavo a través de UART, solicitar los datos de forma sincronizada y subirlos a la red LoRaWAN.
+Este repositorio contiene el firmware para el **Heltec WiFi LoRa 32 (V3)** configurado como un **Nodo de Transmisión (Bridge)**. Su función principal es actuar como puente transparente: recibe datos de presión vía UART desde un microcontrolador externo y los sube inmediatamente a la red LoRaWAN (ChirpStack/TTN) utilizando la librería **RadioLib**.
 
-> 🔗 **Dependencia del Sistema:** Este nodo requiere estar conectado físicamente a un nodo esclavo para obtener lecturas reales.
-> 👉 **[Repositorio del Nodo Esclavo (ESP32-S3)](https://github.com/ualamc158/esp32LectorSensorAnalogicoPresion)**
+> [!IMPORTANT]
+> **Dependencia de Sistema:** Este nodo no genera las lecturas de presión por sí mismo. Requiere estar conectado físicamente al **[Nodo Sensor (ESP32-S3)](https://github.com/ualamc158/esp32lectorsensoranalogicopresion)**, el cual se encarga de la lectura analógica, calibración y filtrado.
 
----
+## 📡 Lógica de Funcionamiento (Arquitectura Push)
 
-## 🚀 1. Funcionalidades Principales
+En esta versión (rama `v2_lorawan-node`), el sistema utiliza una comunicación proactiva por parte del sensor para optimizar la respuesta:
 
-* **Sincronización Maestro-Esclavo:** Solicita datos cada 30 segundos enviando el comando `'G'` por UART.
-* **Conexión LoRaWAN Robusta:** Implementa activación OTAA en la banda EU868. Si la conexión falla, el sistema se reinicia automáticamente tras 5 segundos para intentar un "Join" limpio.
-* **Gestión de Tiempo:** Sincroniza el reloj interno con la hora de compilación para generar timestamps en los registros del monitor serie.
-* **Optimización de Radio:** Configurado específicamente para el chip SX1262 del Heltec V3, incluyendo el uso de TCXO y control de antena.
+1.  **Conexión LoRaWAN:** El Heltec inicia la sesión mediante OTAA en la banda **EU868**. Si la conexión se pierde, el dispositivo está programado para intentar un reinicio limpio.
+2.  **Modo Escucha:** El Heltec permanece a la escucha en su puerto UART (Serial). No solicita datos activamente, simplemente procesa lo que llega por el cable.
+3.  **Transmisión Inmediata:** Cada 30 segundos, el Nodo Sensor envía la cadena de texto (ej. `P:10.50\n`). El Heltec captura el mensaje y utiliza la función `node.sendReceive` de RadioLib para enviarlo a la red LoRaWAN al instante.
+4.  **Sincronización de Logs:** Los mensajes por consola incluyen marcas de tiempo reales sincronizadas con el momento de la compilación.
 
----
+## 🔌 Conexiones Físicas
 
-## 📡 2. Lógica del Protocolo
+Para que la comunicación serie sea estable, es obligatorio conectar ambos dispositivos a una **masa común**.
 
-Para asegurar la integridad de los datos y evitar colisiones, el sistema sigue este flujo:
-
-1.  **Handshake UART:** El Maestro envía el carácter `'G'` (Go).
-2.  **Espera Activa:** El Maestro espera hasta 1500ms la respuesta del Esclavo (ej. `P:10.07`).
-3.  **Transmisión:** Al recibir el dato, se genera un log con timestamp y se envía inmediatamente al Gateway LoRaWAN.
-
----
-
-## 🔌 3. Conexiones Físicas (Esquema de Cables)
-
-Utiliza cables puente para conectar ambas placas compartiendo masa común:
-
-| Pin en Heltec V3 (Maestro) | Pin en ESP32-S3 (Esclavo) | Función |
+| Heltec V3 (Bridge LoRa) | ESP32-S3 (Nodo Sensor) | Función |
 | :--- | :--- | :--- |
-| **GND** | **GND** | **Masa Común** (Obligatorio) |
-| **33** (TX) | **18** (RX) | **Petición:** Envío de orden `'G'` |
-| **35** (RX) | **17** (TX) | **Datos:** Recepción de presión `P:XX.XX` |
+| **GND** | **GND** | **Masa Común** (Indispensable) |
+| **GPIO 35** (RX) | **GPIO 17** (TX) | **Bus de Datos:** Entrada de lecturas de presión |
+| **GPIO 33** (TX) | **GPIO 18** (RX) | Canal de control (Reservado) |
 
----
+### Especificaciones de Radio (SX1262 Interno)
+* **Pines de Control:** NSS (8), IRQ (14), RST (12), BUSY (13).
+* **Bus SPI:** SCK (9), MISO (11), MOSI (10).
 
-## 🛠️ 4. Configuración en ChirpStack (Codec)
+## 🛠️ Configuración del Payload (ChirpStack)
 
-Utiliza el siguiente decodificador JavaScript en el **Device Profile** para procesar los datos recibidos:
+Dado que los datos se envían como texto plano para facilitar el diagnóstico, utiliza este **Payload Codec** en JavaScript dentro de tu Device Profile para extraer el valor numérico:
 
 ```javascript
 function decodeUplink(input) {
+    // Convertir bytes a texto
     var texto = String.fromCharCode.apply(null, input.bytes);
-    var limpio = texto.replace(/[^\x20-\x7E]/g, ''); // Elimina caracteres no deseados
-    var match = limpio.match(/[-+]?[0-9]*\.?[0-9]+/);
+    
+    // Extraer el número (soporta decimales y signos)
+    var match = texto.match(/[-+]?[0-9]*\.?[0-9]+/);
     
     if (match) {
-        return { data: { presion_mb: parseFloat(match[0]), texto_recibido: limpio } };
+        return {
+            data: {
+                presion_mb: parseFloat(match[0]),
+                unidad: "mB",
+                raw_text: texto.trim()
+            }
+        };
     }
-    return { data: { error: "Dato corrupto", raw: texto } };
+    return { data: { error: "Formato de cadena inválido", raw: texto } };
 }
